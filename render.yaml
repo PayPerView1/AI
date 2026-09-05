@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: payperview-ai-service
+    env: docker
+    dockerContext: .
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: CHROMA_PERSIST_DIRECTORY
+        value: ./chroma_db
+      - key: CHROMA_COLLECTION
+        value: brands_clippers_kb
