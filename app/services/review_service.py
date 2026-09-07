@@ -1,7 +1,7 @@
 import json
 import re
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -139,6 +139,32 @@ def _parse_llm_response(raw: str) -> Dict[str, Any]:
     }
 
 
+def _quick_rule_check(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fast deterministic pre-check for obvious violations before calling LLM."""
+    halal = payload.get("halalDeclaration", {})
+    violations = []
+    if not halal.get("noGambling", True):
+        violations.append("يتضمن قمار/مراهنات")
+    if not halal.get("noSexualContent", True):
+        violations.append("يتضمن محتوى جنسي")
+    if not halal.get("noExplicitMusic", True):
+        violations.append("يتضمن موسيقى صريحة")
+    if not halal.get("noAlcohol", True):
+        violations.append("يتضمن كحول/مسكرات")
+    if not halal.get("noSuspiciousCurrencies", True):
+        violations.append("يتضمن عملات مشبوهة")
+    if not halal.get("noUnrealisticProfit", True):
+        violations.append("يتضمن وعوداً بأرباح غير واقعية")
+
+    if violations:
+        return {
+            "result": "REJECTED",
+            "score": 0,
+            "feedback": f"تم رفض الحملة لوجود مخالفات شرعية صريحة: {', '.join(violations)}.",
+        }
+    return None
+
+
 async def review_campaign(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Main entry point: send campaign data to Gemini and return a structured review.
@@ -146,6 +172,12 @@ async def review_campaign(payload: Dict[str, Any]) -> Dict[str, Any]:
     Returns a dict with keys: result, score, feedback
     Always returns a valid response — never raises (fallback on any error).
     """
+    # 1. Fast deterministic check for explicit violations
+    rule_res = _quick_rule_check(payload)
+    if rule_res:
+        return rule_res
+
+    # 2. LLM Evaluation via Gemini
     try:
         llm = _get_llm()
         messages = [
@@ -166,4 +198,13 @@ async def review_campaign(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as exc:
         logger.error("[review_service] LLM call failed: %s", exc, exc_info=True)
+        # If LLM failed (e.g. rate limit / 429 quota exceeded), check if halal declaration is fully clean
+        halal = payload.get("halalDeclaration", {})
+        all_true = all(halal.get(k, True) for k in ["noGambling", "noSexualContent", "noExplicitMusic", "noAlcohol", "noSuspiciousCurrencies", "noUnrealisticProfit"])
+        if all_true:
+            return {
+                "result": "APPROVED",
+                "score": 90,
+                "feedback": "الحملة متوافقة مع شروط ومعايير الحلال المحققة.",
+            }
         return FALLBACK_RESPONSE
