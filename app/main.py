@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.routes.chat import router as chat_router
+from app.routes.review import router as review_router
 from app.core.config import get_settings
 from app.db.database import init_db
 
@@ -37,6 +38,7 @@ app.add_middleware(
 
 # Register routes
 app.include_router(chat_router)
+app.include_router(review_router)
 
 
 @app.get("/health")
