@@ -67,7 +67,9 @@ async def get_current_user(
             detail="Authorization header missing or invalid format. Required: Bearer <JWT_TOKEN>",
         )
 
-    return decode_jwt_token(credentials.credentials)
+    decoded = decode_jwt_token(credentials.credentials)
+    decoded["raw_token"] = credentials.credentials
+    return decoded
 
 
 def create_access_token(

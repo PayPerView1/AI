@@ -100,6 +100,7 @@ async def send_thread_message(
     """
     user_id = current_user["user_id"]
     role = current_user["role"]
+    user_token = current_user.get("raw_token", "")
 
     response = await chat_service.process_thread_chat(
         session=session,
@@ -107,6 +108,7 @@ async def send_thread_message(
         role=role,
         thread_id=thread_id,
         user_message=body.content,
+        user_token=user_token,
     )
     return response
 

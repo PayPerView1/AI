@@ -1,11 +1,30 @@
+"""
+tools.py
+────────
+Function-calling tools for the PayPerView AI chatbot.
+
+BRAND tools now make real async HTTP calls to:
+    https://payperview-platform.onrender.com
+
+CLIPPER tools (earnings, submissions) remain as mock data until
+the Express backend exposes dedicated Clipper endpoints.
+
+All async tools accept `user_token` and forward it as
+Authorization: Bearer <token> to the backend.
+"""
+
 from typing import Dict, Any, List, Optional
-import json
+import asyncio
+
+from app.core.backend_client import backend_get, backend_post
 
 
-# ─── 1. CLIPPER TOOLS ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. CLIPPER TOOLS  (still mock — no Sprint 2 Express endpoints yet)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def get_weekly_earnings(user_id: str, week: str = "current") -> Dict[str, Any]:
-    """Fetch weekly earnings breakdown for a creator (Clipper)."""
+    """Fetch weekly earnings breakdown for a creator (Clipper) — mock until backend exposes endpoint."""
     return {
         "user_id": user_id,
         "week": week,
@@ -17,12 +36,12 @@ def get_weekly_earnings(user_id: str, week: str = "current") -> Dict[str, Any]:
         "breakdown": [
             {"campaign": "Tech Review Reels", "amount": 100.00, "date": "2026-09-01"},
             {"campaign": "Fitness App Promo", "amount": 140.00, "date": "2026-09-03"},
-        ]
+        ],
     }
 
 
 def get_monthly_earnings(user_id: str, month: str = "September", year: int = 2026) -> Dict[str, Any]:
-    """Fetch monthly earnings breakdown for a creator (Clipper)."""
+    """Fetch monthly earnings breakdown for a creator (Clipper) — mock."""
     return {
         "user_id": user_id,
         "month": month,
@@ -35,12 +54,12 @@ def get_monthly_earnings(user_id: str, month: str = "September", year: int = 202
 
 
 def get_submissions(user_id: str, status: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
-    """Query creator submissions filtered by status (pending, approved, rejected)."""
+    """Query creator submissions filtered by status — mock."""
     all_submissions = [
-        {"id": "sub_101", "campaignName": "Gaming Laptop Shorts", "status": "approved", "amount": 80.00, "submittedAt": "2026-09-04"},
-        {"id": "sub_102", "campaignName": "Energy Drink Reel", "status": "approved", "amount": 60.00, "submittedAt": "2026-09-03"},
-        {"id": "sub_103", "campaignName": "Fashion Haul Clips", "status": "pending", "amount": 45.00, "submittedAt": "2026-09-05"},
-        {"id": "sub_104", "campaignName": "Crypto Wallet App", "status": "rejected", "amount": 0.00, "submittedAt": "2026-09-02", "reason": "Low video quality"},
+        {"id": "sub_101", "campaignName": "Gaming Laptop Shorts",  "status": "approved", "amount": 80.00,  "submittedAt": "2026-09-04"},
+        {"id": "sub_102", "campaignName": "Energy Drink Reel",     "status": "approved", "amount": 60.00,  "submittedAt": "2026-09-03"},
+        {"id": "sub_103", "campaignName": "Fashion Haul Clips",    "status": "pending",  "amount": 45.00,  "submittedAt": "2026-09-05"},
+        {"id": "sub_104", "campaignName": "Crypto Wallet App",     "status": "rejected", "amount": 0.00,   "submittedAt": "2026-09-02", "reason": "Low video quality"},
     ]
     if status:
         filtered = [s for s in all_submissions if s["status"].lower() == status.lower()]
@@ -49,37 +68,33 @@ def get_submissions(user_id: str, status: Optional[str] = None, limit: int = 5) 
     return {"user_id": user_id, "count": len(filtered[:limit]), "submissions": filtered[:limit]}
 
 
-def get_available_campaigns(category: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
-    """List active campaigns open for submission."""
+def get_available_campaigns_for_clipper(category: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
+    """List active campaigns open for submission (CLIPPERs) — mock."""
     campaigns = [
-        {"id": "camp_201", "title": "AI SaaS Platform Demo", "category": "Tech", "payout_per_1k_views": 15.00, "max_payout": 300.00, "status": "active"},
-        {"id": "camp_202", "title": "Protein Powder Unboxing", "category": "Fitness", "payout_per_1k_views": 12.00, "max_payout": 250.00, "status": "active"},
-        {"id": "camp_203", "title": "Mobile RPG Game Trailer", "category": "Gaming", "payout_per_1k_views": 18.00, "max_payout": 500.00, "status": "active"},
+        {
+            "id": "64f1a2b3c4d5e6f7a8b9c0d1",
+            "title": "حملة رمضان 2026",
+            "category": "CLIPPING",
+            "payout_per_1k_views": 10.00,
+            "targetCountries": ["SAU", "EGY", "ARE"],
+            "brief": {"mainIdea": "تسليط الضوء على منتجنا الجديد", "tone": "ودي وحيوي", "keywords": ["رمضان", "عروض"]},
+        },
+        {
+            "id": "64f1a2b3c4d5e6f7a8b9c0d2",
+            "title": "Protein Powder Unboxing",
+            "category": "UGC",
+            "payout_per_1k_views": 12.00,
+            "targetCountries": ["USA", "GBR"],
+            "brief": {"mainIdea": "Show yourself using the product", "tone": "Energetic", "keywords": ["fitness", "health"]},
+        },
     ]
     if category:
         campaigns = [c for c in campaigns if category.lower() in c["category"].lower()]
     return {"count": len(campaigns[:limit]), "campaigns": campaigns[:limit]}
 
 
-def get_campaign_details(campaign_id: str) -> Dict[str, Any]:
-    """View specific campaign requirements and guidelines."""
-    return {
-        "campaign_id": campaign_id,
-        "title": "AI SaaS Platform Demo",
-        "description": "Create a 30-60 second vertical video (TikTok/Reels/Shorts) highlighting our AI assistant tool.",
-        "requirements": [
-            "Must show the user interface on screen",
-            "Include call to action in caption: 'Link in bio'",
-            "No copyright music background",
-        ],
-        "payout_rate": "$15 per 1,000 verified views",
-        "budget_remaining": "$1,200 / $3,000",
-        "deadline": "2026-09-30",
-    }
-
-
 def get_profile_summary(user_id: str) -> Dict[str, Any]:
-    """Summary of creator account status and rating."""
+    """Summary of creator account status and rating — mock."""
     return {
         "user_id": user_id,
         "role": "CLIPPER",
@@ -91,122 +106,191 @@ def get_profile_summary(user_id: str) -> Dict[str, Any]:
     }
 
 
-# ─── 2. BRAND TOOLS ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. BRAND TOOLS  (real HTTP calls to Express backend on Render)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def get_campaign_stats(user_id: str, campaign_id: str) -> Dict[str, Any]:
-    """Detailed performance metrics for a specific brand campaign."""
+async def get_brand_campaigns(
+    user_id: str,
+    user_token: str,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """Fetch list of campaigns for the authenticated brand.
+    -> GET /api/v1/campaigns"""
+    params: Dict[str, Any] = {"limit": limit}
+    if status and status != "ALL":
+        params["status"] = status
+    if category:
+        params["category"] = category
+    return await backend_get("/api/v1/campaigns", user_token, params=params)
+
+
+async def get_campaign_full_details(
+    user_id: str,
+    user_token: str,
+    campaign_id: str,
+) -> Dict[str, Any]:
+    """Fetch full details of a specific campaign by ID.
+    -> GET /api/v1/campaigns/:campaignId"""
+    return await backend_get(f"/api/v1/campaigns/{campaign_id}", user_token)
+
+
+async def get_campaign_ai_review(
+    user_id: str,
+    user_token: str,
+    campaign_id: str,
+) -> Dict[str, Any]:
+    """Fetch AI review results for a specific campaign.
+    -> GET /api/v1/campaigns/:campaignId/ai-review"""
+    return await backend_get(f"/api/v1/campaigns/{campaign_id}/ai-review", user_token)
+
+
+async def get_brand_dashboard_stats(
+    user_id: str,
+    user_token: str,
+) -> Dict[str, Any]:
+    """Fetch dashboard statistics for the brand.
+    -> GET /api/v1/campaigns/statistics"""
+    return await backend_get("/api/v1/campaigns/statistics", user_token)
+
+
+async def get_campaign_categories(user_token: str) -> Dict[str, Any]:
+    """Fetch all available campaign categories.
+    -> GET /api/v1/campaigns/categories (Public)"""
+    return await backend_get("/api/v1/campaigns/categories", user_token)
+
+
+async def get_sub_categories(user_token: str) -> Dict[str, Any]:
+    """Fetch sub-categories available for MIXED campaigns.
+    -> GET /api/v1/campaigns/categories/sub-categories"""
+    return await backend_get("/api/v1/campaigns/categories/sub-categories", user_token)
+
+
+async def get_campaign_stats(
+    user_id: str,
+    user_token: str,
+    campaign_id: str,
+) -> Dict[str, Any]:
+    """Fetch performance metrics for a specific brand campaign.
+    -> GET /api/v1/campaigns/:campaignId (extracts stats field)"""
+    result = await backend_get(f"/api/v1/campaigns/{campaign_id}", user_token)
+    campaign = result.get("data", {}).get("campaign", result)
     return {
         "user_id": user_id,
         "campaign_id": campaign_id,
-        "title": "Summer Product Launch",
-        "status": "active",
-        "total_views": 145000,
-        "total_submissions": 28,
-        "approved_submissions": 22,
-        "spent_budget": 2175.00,
-        "total_budget": 5000.00,
-        "engagement_rate": "4.8%",
+        "title": campaign.get("name", ""),
+        "status": campaign.get("status", ""),
+        "stats": campaign.get("stats", {}),
+        "totalBudget": campaign.get("totalBudget"),
+        "remainingBudget": campaign.get("remainingBudget"),
     }
 
 
-def list_campaigns(user_id: str, status: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
-    """List campaigns belonging to the Brand advertiser."""
-    campaigns = [
-        {"id": "camp_b1", "title": "Summer Product Launch", "status": "active", "spent": 2175.00, "budget": 5000.00, "submissions": 28},
-        {"id": "camp_b2", "title": "Back to School Promo", "status": "active", "spent": 800.00, "budget": 2000.00, "submissions": 12},
-        {"id": "camp_b3", "title": "Q2 Brand Awareness", "status": "ended", "spent": 3000.00, "budget": 3000.00, "submissions": 45},
-    ]
+async def list_campaigns(
+    user_id: str,
+    user_token: str,
+    status: Optional[str] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """List campaigns belonging to the brand advertiser.
+    -> GET /api/v1/campaigns"""
+    params: Dict[str, Any] = {"limit": limit}
     if status:
-        campaigns = [c for c in campaigns if c["status"].lower() == status.lower()]
-    return {"user_id": user_id, "count": len(campaigns[:limit]), "campaigns": campaigns[:limit]}
+        params["status"] = status
+    return await backend_get("/api/v1/campaigns", user_token, params=params)
 
 
-def get_budget_summary(user_id: str) -> Dict[str, Any]:
-    """Query advertiser account balances and spend rates."""
+async def get_budget_summary(user_id: str, user_token: str) -> Dict[str, Any]:
+    """Query advertiser account balances via dashboard statistics.
+    -> GET /api/v1/campaigns/statistics"""
+    result = await backend_get("/api/v1/campaigns/statistics", user_token)
+    stats = result.get("data", {}).get("statistics", {})
     return {
         "user_id": user_id,
-        "total_account_budget": 10000.00,
-        "allocated_budget": 7000.00,
-        "spent_budget": 2975.00,
-        "remaining_unallocated_balance": 3000.00,
+        "total_budget_spent": stats.get("totalBudgetSpent", 0),
+        "average_cpm": stats.get("averageCpm", 0),
+        "active_campaigns": stats.get("activeCampaigns", 0),
         "currency": "USD",
     }
 
 
-def get_submissions_for_campaign(campaign_id: str, status: Optional[str] = None) -> Dict[str, Any]:
-    """Query creator submissions on a brand campaign."""
-    submissions = [
-        {"id": "sub_501", "creatorName": "Alex Clipz", "views": 25000, "status": "approved", "payout": 375.00},
-        {"id": "sub_502", "creatorName": "Sarah Media", "views": 18000, "status": "approved", "payout": 270.00},
-        {"id": "sub_503", "creatorName": "Viral Shorts Daily", "views": 0, "status": "pending", "payout": 0.00},
-    ]
-    if status:
-        submissions = [s for s in submissions if s["status"].lower() == status.lower()]
-    return {"campaign_id": campaign_id, "count": len(submissions), "submissions": submissions}
-
-
-def create_campaign_draft(
-    user_id: str,
-    title: str,
-    description: str,
-    budget: float,
-    category: str = "general",
-    deadline: Optional[str] = None
-) -> Dict[str, Any]:
-    """Initialize a new draft campaign for the Brand."""
-    return {
-        "success": True,
-        "message": "Draft campaign created successfully.",
-        "campaign": {
-            "id": "camp_draft_999",
-            "brand_id": user_id,
-            "title": title,
-            "description": description,
-            "budget": budget,
-            "category": category,
-            "deadline": deadline or "2026-10-01",
-            "status": "draft",
-        }
-    }
-
-
-def get_account_summary(user_id: str) -> Dict[str, Any]:
-    """Summary of advertiser brand account stats."""
+async def get_account_summary(user_id: str, user_token: str) -> Dict[str, Any]:
+    """Summary of advertiser brand account stats.
+    -> GET /api/v1/campaigns/statistics"""
+    result = await backend_get("/api/v1/campaigns/statistics", user_token)
+    stats = result.get("data", {}).get("statistics", {})
     return {
         "user_id": user_id,
-        "company": "PayPerView Brand Partner",
         "role": "BRAND",
-        "active_campaigns_count": 2,
-        "total_creators_engaged": 40,
-        "total_impressions": 420000,
+        "active_campaigns_count": stats.get("activeCampaigns", 0),
+        "total_campaigns": stats.get("totalCampaigns", 0),
+        "total_budget_spent": stats.get("totalBudgetSpent", 0),
     }
 
 
-# ─── TOOL DISPATCHER ─────────────────────────────────────────────────────────
+async def get_submissions_for_campaign(
+    campaign_id: str,
+    user_token: str,
+    status: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Query creator submissions on a brand campaign.
+    -> GET /api/v1/campaigns/:campaignId"""
+    return await backend_get(f"/api/v1/campaigns/{campaign_id}", user_token)
 
-def execute_tool(tool_name: str, user_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. ASYNC TOOL DISPATCHER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def execute_tool(
+    tool_name: str,
+    user_id: str,
+    args: Dict[str, Any],
+    user_token: str = "",
+) -> Dict[str, Any]:
     """
-    Execute tool functions dynamically by name with strictly scoped user_id.
+    Async tool dispatcher. Executes tool functions by name.
+    user_token is forwarded to all async BRAND tool calls.
     """
-    tool_map = {
-        "get_weekly_earnings": lambda: get_weekly_earnings(user_id, args.get("week", "current")),
-        "get_monthly_earnings": lambda: get_monthly_earnings(user_id, args.get("month", "September"), args.get("year", 2026)),
-        "get_submissions": lambda: get_submissions(user_id, args.get("status"), args.get("limit", 5)),
-        "get_available_campaigns": lambda: get_available_campaigns(args.get("category"), args.get("limit", 5)),
-        "get_campaign_details": lambda: get_campaign_details(args.get("campaignId") or args.get("campaign_id", "camp_201")),
-        "get_profile_summary": lambda: get_profile_summary(user_id),
-        "get_campaign_stats": lambda: get_campaign_stats(user_id, args.get("campaignId") or args.get("campaign_id", "camp_b1")),
-        "list_campaigns": lambda: list_campaigns(user_id, args.get("status"), args.get("limit", 5)),
-        "get_budget_summary": lambda: get_budget_summary(user_id),
-        "get_submissions_for_campaign": lambda: get_submissions_for_campaign(args.get("campaignId") or args.get("campaign_id", "camp_b1"), args.get("status")),
-        "create_campaign_draft": lambda: create_campaign_draft(user_id, args.get("title", "New Campaign"), args.get("description", ""), args.get("budget", 1000.0), args.get("category", "general"), args.get("deadline")),
-        "get_account_summary": lambda: get_account_summary(user_id),
+    campaign_id = args.get("campaignId") or args.get("campaign_id", "")
+
+    # ── Sync CLIPPER tools (mock data) ─────────────────────────────────────────
+    sync_tool_map = {
+        "get_weekly_earnings":                 lambda: get_weekly_earnings(user_id, args.get("week", "current")),
+        "get_monthly_earnings":                lambda: get_monthly_earnings(user_id, args.get("month", "September"), args.get("year", 2026)),
+        "get_submissions":                     lambda: get_submissions(user_id, args.get("status"), args.get("limit", 5)),
+        "get_available_campaigns_for_clipper": lambda: get_available_campaigns_for_clipper(args.get("category"), args.get("limit", 5)),
+        "get_campaign_details":                lambda: {"campaign_id": campaign_id, "note": "Use get_campaign_full_details for BRAND campaigns."},
+        "get_profile_summary":                 lambda: get_profile_summary(user_id),
     }
 
-    if tool_name not in tool_map:
-        return {"error": f"Unknown tool name: {tool_name}"}
+    if tool_name in sync_tool_map:
+        try:
+            return sync_tool_map[tool_name]()
+        except Exception as e:
+            return {"error": f"Error in sync tool '{tool_name}': {str(e)}"}
 
-    try:
-        return tool_map[tool_name]()
-    except Exception as e:
-        return {"error": f"Error executing tool '{tool_name}': {str(e)}"}
+    # ── Async BRAND tools (real HTTP to Express backend) ──────────────────────
+    async_tool_map = {
+        "get_brand_campaigns":          lambda: get_brand_campaigns(user_id, user_token, args.get("status"), args.get("category"), args.get("limit", 20)),
+        "get_campaign_full_details":    lambda: get_campaign_full_details(user_id, user_token, campaign_id),
+        "get_campaign_ai_review":       lambda: get_campaign_ai_review(user_id, user_token, campaign_id),
+        "get_brand_dashboard_stats":    lambda: get_brand_dashboard_stats(user_id, user_token),
+        "get_campaign_stats":           lambda: get_campaign_stats(user_id, user_token, campaign_id),
+        "list_campaigns":               lambda: list_campaigns(user_id, user_token, args.get("status"), args.get("limit", 5)),
+        "get_budget_summary":           lambda: get_budget_summary(user_id, user_token),
+        "get_account_summary":          lambda: get_account_summary(user_id, user_token),
+        "get_submissions_for_campaign": lambda: get_submissions_for_campaign(campaign_id, user_token, args.get("status")),
+        "get_campaign_categories":      lambda: get_campaign_categories(user_token),
+        "get_sub_categories":           lambda: get_sub_categories(user_token),
+    }
+
+    if tool_name in async_tool_map:
+        try:
+            return await async_tool_map[tool_name]()
+        except Exception as e:
+            return {"error": f"Error in async tool '{tool_name}': {str(e)}"}
+
+    return {"error": f"Unknown tool name: '{tool_name}'"}
