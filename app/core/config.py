@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     ai_service_port: int = 8001
     jwt_secret: str = "supersecretkey_payperview_ai_2026"
     jwt_algorithm: str = "HS256"
+    backend_url: str = "https://payperview-platform.onrender.com"
 
     model_config = {"env_file": ".env", "case_sensitive": False}
 

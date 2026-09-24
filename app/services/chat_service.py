@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.db.models import ChatThread, ChatMessage
 from app.rag.prompts import build_system_prompt
 from app.rag.retriever import retrieve_relevant_docs
-from app.rag.tools import execute_tool, get_weekly_earnings, get_submissions, list_campaigns, get_budget_summary
+from app.rag.tools import execute_tool, get_weekly_earnings, get_submissions
 
 settings = get_settings()
 _llm = None
@@ -44,9 +44,10 @@ def sanitize_user_message(content: str) -> str:
     return cleaned.strip()
 
 
-def build_user_context(user_id: str, role: str) -> Dict[str, Any]:
+async def build_user_context(user_id: str, role: str, user_token: str = "") -> Dict[str, Any]:
     """
     Fetch user profile stats and recent metrics for prompt context injection.
+    For BRAND users, fetches live data from the Express backend using user_token.
     """
     role = role.upper()
     if role == "CLIPPER":
@@ -64,25 +65,33 @@ def build_user_context(user_id: str, role: str) -> Dict[str, Any]:
             "recent_submissions": subs.get("submissions", []),
         }
     else:
-        camps = list_campaigns(user_id, limit=5)
-        budget = get_budget_summary(user_id)
+        # Fetch real data from Express backend
+        from app.rag.tools import get_brand_campaigns, get_brand_dashboard_stats
+        try:
+            camps_res = await get_brand_campaigns(user_id, user_token, limit=5)
+            camps = camps_res.get("data", {}).get("campaigns", [])
+            stats_res = await get_brand_dashboard_stats(user_id, user_token)
+            stats = stats_res.get("data", {}).get("statistics", {})
+        except Exception:
+            camps = []
+            stats = {}
         return {
             "name": f"BrandAdmin_{user_id[:6]}",
             "companyName": "PayPerView Advertisers",
             "role": "BRAND",
             "campaigns": [
                 {
-                    "title": c["title"],
-                    "status": c["status"],
-                    "submissionsCount": c["submissions"],
-                    "spentBudget": c["spent"],
-                    "totalBudget": c["budget"],
-                    "totalViews": 50000,
+                    "title": c.get("name"),
+                    "status": c.get("status"),
+                    "spentBudget": c.get("stats", {}).get("totalSpent"),
+                    "totalBudget": c.get("totalBudget"),
+                    "totalViews": c.get("stats", {}).get("totalViews"),
                 }
-                for c in camps.get("campaigns", [])
+                for c in camps
             ],
             "budget": {
-                "remaining": budget.get("remaining_unallocated_balance", 3000.00),
+                "spent": stats.get("totalBudgetSpent", 0),
+                "active_campaigns": stats.get("activeCampaigns", 0),
             },
         }
 
@@ -182,6 +191,7 @@ async def process_thread_chat(
     role: str,
     thread_id: str,
     user_message: str,
+    user_token: str = "",
 ) -> Dict[str, Any]:
     """
     Full AI execution sequence matching Section 4.4 requirements:
@@ -218,7 +228,7 @@ async def process_thread_chat(
         session.add(thread)
 
     # 4. Fetch User Context & RAG Docs
-    user_context = build_user_context(user_id, role)
+    user_context = await build_user_context(user_id, role, user_token)
 
     try:
         rag_docs = retrieve_relevant_docs(safe_content, k=3)
@@ -239,13 +249,46 @@ async def process_thread_chat(
             messages.append(AIMessage(content=msg.content))
     messages.append(HumanMessage(content=safe_content))
 
-    # 6. Invoke LLM
+    # 6. Invoke LLM with Tool Definitions
     final_response_text = ""
+    
+    brand_tools = [
+        {"name": "get_brand_campaigns", "description": "Fetch list of campaigns for the brand", "parameters": {"type": "object", "properties": {"status": {"type": "string"}, "category": {"type": "string"}}}},
+        {"name": "get_campaign_full_details", "description": "Fetch full details of a specific campaign by ID", "parameters": {"type": "object", "properties": {"campaignId": {"type": "string"}}, "required": ["campaignId"]}},
+        {"name": "get_campaign_ai_review", "description": "Fetch AI review results for a campaign", "parameters": {"type": "object", "properties": {"campaignId": {"type": "string"}}, "required": ["campaignId"]}},
+        {"name": "get_brand_dashboard_stats", "description": "Fetch dashboard statistics for the brand", "parameters": {"type": "object", "properties": {}}}
+    ]
+    
+    clipper_tools = [
+        {"name": "get_available_campaigns_for_clipper", "description": "List active campaigns open for submission", "parameters": {"type": "object", "properties": {"category": {"type": "string"}}}},
+        {"name": "get_weekly_earnings", "description": "Fetch weekly earnings", "parameters": {"type": "object", "properties": {}}}
+    ]
+    
+    shared_tools = [
+        {"name": "get_campaign_categories", "description": "Fetch all available campaign categories", "parameters": {"type": "object", "properties": {}}},
+        {"name": "get_sub_categories", "description": "Fetch available sub-categories for MIXED campaigns", "parameters": {"type": "object", "properties": {}}}
+    ]
+    
+    available_tools = shared_tools + (brand_tools if role == "BRAND" else clipper_tools)
+
     try:
         llm = get_llm()
-        ai_msg = await llm.ainvoke(messages)
-
-        # Handle string response or tool call response
+        llm_with_tools = llm.bind_tools(available_tools)
+        
+        ai_msg = await llm_with_tools.ainvoke(messages)
+        
+        # 7. Resolve tool calls if triggered by LLM
+        if ai_msg.tool_calls:
+            messages.append(ai_msg)
+            for tool_call in ai_msg.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                tool_result = await execute_tool(tool_name, user_id, tool_args, user_token=user_token)
+                messages.append(ToolMessage(content=json.dumps(tool_result, ensure_ascii=False), tool_call_id=tool_call["id"]))
+            
+            # Re-invoke LLM with tool results
+            ai_msg = await llm_with_tools.ainvoke(messages)
+            
         final_response_text = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
         if isinstance(final_response_text, list):
             parts = [p.get("text", str(p)) if isinstance(p, dict) else str(p) for p in final_response_text]
@@ -261,10 +304,9 @@ async def process_thread_chat(
                 f"من خلال {earnings['approved_submissions']} مشاركات مقبولة. هل تريد تفاصيل إضافية عن الحملات المتاحة؟"
             )
         elif role == "BRAND" and ("campaign" in safe_content.lower() or "حملة" in safe_content):
-            camps = list_campaigns(user_id)
+            active = user_context.get("budget", {}).get("active_campaigns", 0)
             final_response_text = (
-                f"مرحباً بك! لديك {camps['count']} حملات نشطة حالياً. "
-                f"إجمالي ميزانيتك المتبقية هو **${user_context['budget']['remaining']} USD**. كيف يمكنني مساعدتك اليوم؟"
+                f"مرحباً بك! لديك {active} حملات نشطة حالياً. كيف يمكنني مساعدتك اليوم؟"
             )
         else:
             final_response_text = (

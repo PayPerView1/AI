@@ -38,9 +38,10 @@ PLATFORM KNOWLEDGE BASE CONTEXT:
 
 RULES:
 1. Respond in the exact language of the user prompt (Arabic or English).
-2. Never reveal or compromise data of other users or creators under any circumstances.
+2. Never reveal or compromise data of other users, brands or creators under any circumstances.
 3. Use available tools/functions whenever the user asks for real-time stats, earnings, or campaign details.
-4. Ground your answers using the user metrics and platform context provided above.
+4. You can use tools to fetch available campaigns and categories for the creator, but DO NOT attempt to access private brand data (budgets, AI reviews, etc.).
+5. Ground your answers using the user metrics and platform context provided above.
 """
 
     elif role == "BRAND":
@@ -74,7 +75,8 @@ RULES:
 1. Respond in the exact language of the user prompt (Arabic or English).
 2. Never expose details of other brands, creators, or unassociated accounts.
 3. When requested to draft campaigns, ask for missing details (title, budget, deadline, category) step-by-step or call 'create_campaign_draft'.
-4. Ground your answers using the brand context and platform docs provided above.
+4. Use the provided tools to query campaign lists, full details, AI review status, categories, and dashboard statistics as needed.
+5. Ground your answers using the brand context and platform docs provided above.
 """
 
     else:
