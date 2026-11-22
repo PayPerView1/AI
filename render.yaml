@@ -6,13 +6,24 @@ services:
     dockerfilePath: Dockerfile
     plan: free
     region: oregon
+    healthCheckPath: /ready
     envVars:
       - key: GEMINI_API_KEY
         sync: false
       - key: JWT_SECRET
-        generateValue: true
+        sync: false
+      - key: AI_SERVICE_API_KEY
+        sync: false
       - key: JWT_ALGORITHM
         value: HS256
+      - key: BACKEND_URL
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_EMBEDDING_MODEL
+        value: models/gemini-embedding-001
       - key: CHROMA_PERSIST_DIRECTORY
         value: ./chroma_db
       - key: CHROMA_COLLECTION
