@@ -1,100 +1,266 @@
+import asyncio
 import json
+import logging
 import re
-from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from sqlmodel import Session, select
 from fastapi import HTTPException, status
-
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_google_genai.chat_models import (
+    GoogleAuthenticationError,
+    GoogleInvalidRequestError,
+    GooglePermissionDeniedError,
+    GoogleRateLimitError,
+)
+from sqlmodel import Session, select
 
 from app.core.config import get_settings
-from app.db.models import ChatThread, ChatMessage
+from app.db.models import ChatMessage, ChatThread
 from app.rag.prompts import build_system_prompt
 from app.rag.retriever import retrieve_relevant_docs
-from app.rag.tools import execute_tool, get_weekly_earnings, get_submissions, list_campaigns, get_budget_summary
+from app.rag.tools import execute_tool, tool_definitions_for_role
 
-settings = get_settings()
-_llm = None
+
+logger = logging.getLogger(__name__)
+_llm: ChatGoogleGenerativeAI | None = None
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MAX_CONTEXT_CHARS = 8000
+_MAX_TOOL_CALLS = 3
+_MAX_TOOL_RESULT_CHARS = 6000
+_MAX_RESPONSE_CHARS = 12000
 
 
 def get_llm() -> ChatGoogleGenerativeAI:
-    """Get or initialize the Gemini LLM instance."""
+    """Create the configured Gemini model on demand; never substitute a fake key."""
     global _llm
-    if _llm is None:
-        key = settings.gemini_api_key or "MOCK_KEY"
-        _llm = ChatGoogleGenerativeAI(
-            model="gemini-3.6-flash",
-            google_api_key=key,
-            temperature=0.2,
+    settings = get_settings()
+    if not settings.gemini_api_key.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI provider is not configured.",
         )
+    if _llm is None:
+        model_kwargs: Dict[str, Any] = {
+            "model": settings.gemini_model,
+            "api_key": settings.gemini_api_key,
+            "max_tokens": 1200,
+            "request_timeout": settings.gemini_request_timeout,
+            "retries": 2,
+        }
+        if settings.gemini_model.removeprefix("models/").startswith("gemini-3"):
+            model_kwargs["thinking_level"] = "low"
+        else:
+            model_kwargs["temperature"] = 0.2
+        _llm = ChatGoogleGenerativeAI(**model_kwargs)
     return _llm
 
 
+def reset_llm_cache() -> None:
+    global _llm
+    _llm = None
+
+
 def sanitize_user_message(content: str) -> str:
-    """
-    Sanitize user input to prevent prompt injection and malicious payload patterns.
-    """
+    """Normalize transport noise without pretending to neutralize prompt injection."""
     if not content:
         return ""
-    # Strip potential dangerous system prompt override tags
-    cleaned = re.sub(r'(?i)<system>.*?</system>', '', content)
-    cleaned = re.sub(r'(?i)ignore previous instructions', '', cleaned)
-    return cleaned.strip()
+    return _CONTROL_CHARS.sub("", content).strip()
 
 
-def build_user_context(user_id: str, role: str) -> Dict[str, Any]:
-    """
-    Fetch user profile stats and recent metrics for prompt context injection.
-    """
-    role = role.upper()
-    if role == "CLIPPER":
-        earnings = get_weekly_earnings(user_id)
-        subs = get_submissions(user_id, limit=5)
-        return {
-            "name": f"Creator_{user_id[:6]}",
-            "role": "CLIPPER",
-            "interests": "Reels, Shorts, Tech Reviews, Gaming",
-            "metrics": {
-                "thisWeekEarnings": earnings.get("total_earnings", 240.00),
-                "approvedCount": earnings.get("approved_submissions", 12),
-                "pendingCount": earnings.get("pending_submissions", 2),
-            },
-            "recent_submissions": subs.get("submissions", []),
-        }
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        answer = content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        answer = "\n".join(parts).strip()
     else:
-        camps = list_campaigns(user_id, limit=5)
-        budget = get_budget_summary(user_id)
-        return {
-            "name": f"BrandAdmin_{user_id[:6]}",
-            "companyName": "PayPerView Advertisers",
-            "role": "BRAND",
-            "campaigns": [
-                {
-                    "title": c["title"],
-                    "status": c["status"],
-                    "submissionsCount": c["submissions"],
-                    "spentBudget": c["spent"],
-                    "totalBudget": c["budget"],
-                    "totalViews": 50000,
-                }
-                for c in camps.get("campaigns", [])
-            ],
-            "budget": {
-                "remaining": budget.get("remaining_unallocated_balance", 3000.00),
-            },
-        }
+        answer = ""
+
+    if not answer or len(answer) > _MAX_RESPONSE_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The AI provider returned an invalid response.",
+        )
+    return answer
 
 
-# ─── THREAD MANAGEMENT SERVICES ─────────────────────────────────────────────
+def _build_rag_context(query: str, role: str) -> tuple[str, list[Dict[str, str]]]:
+    documents = retrieve_relevant_docs(query, k=3, role=role)
+
+    sections: list[str] = []
+    sources: list[Dict[str, str]] = []
+    remaining = _MAX_CONTEXT_CHARS
+    for document in documents:
+        source = str(document.metadata.get("source") or "platform documentation")[:120]
+        content = document.page_content.strip()
+        if not content or remaining <= 0:
+            continue
+        section = f"Source: {source}\n{content[:remaining]}"
+        sections.append(section)
+        sources.append({
+            "source": source,
+            "category": str(document.metadata.get("category") or "general")[:80],
+        })
+        remaining -= len(section)
+    return "\n\n".join(sections), sources
+
+
+def _history_messages(records: List[ChatMessage]) -> list[Any]:
+    settings = get_settings()
+    selected: list[ChatMessage] = []
+    used_chars = 0
+    for record in reversed(records):
+        if record.role not in {"user", "assistant"}:
+            continue
+        content = record.content.strip()
+        if not content:
+            continue
+        if selected and used_chars + len(content) > settings.max_history_chars:
+            break
+        if not selected and len(content) > settings.max_history_chars:
+            content = content[-settings.max_history_chars:]
+        selected.append(record.model_copy(update={"content": content}))
+        used_chars += len(content)
+
+    messages: list[Any] = []
+    for record in reversed(selected):
+        if record.role == "user":
+            messages.append(HumanMessage(content=record.content))
+        else:
+            messages.append(AIMessage(content=record.content))
+    return messages
+
+
+async def _generate_answer(
+    user_id: str,
+    role: str,
+    user_message: str,
+    user_token: str,
+    history: Optional[List[ChatMessage]] = None,
+    response_preference: str = "NEUTRAL",
+) -> tuple[str, list[Dict[str, str]]]:
+    role = role.upper()
+    if role not in {"CLIPPER", "BRAND"}:
+        raise HTTPException(status_code=403, detail="This account role cannot use the assistant.")
+
+    try:
+        rag_context, sources = await asyncio.to_thread(_build_rag_context, user_message, role)
+    except Exception as exc:
+        logger.warning("RAG retrieval failed (type=%s role=%s)", type(exc).__name__, role)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform knowledge is temporarily unavailable. Please retry shortly.",
+        ) from None
+    system_prompt = build_system_prompt({}, role, rag_context, response_preference)
+    messages = [SystemMessage(content=system_prompt)]
+    messages.extend(_history_messages(history or []))
+    messages.append(HumanMessage(content=user_message))
+
+    try:
+        llm = get_llm()
+        available_tools = tool_definitions_for_role(role)
+        first_model = llm.bind_tools(available_tools) if available_tools else llm
+        response = await asyncio.wait_for(
+            first_model.ainvoke(messages, candidate_count=None),
+            timeout=get_settings().gemini_request_timeout + 5,
+        )
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if tool_calls:
+            messages.append(response)
+            calls_to_run = tool_calls[:_MAX_TOOL_CALLS]
+            results = await asyncio.gather(
+                *[
+                    execute_tool(
+                        call.get("name", ""),
+                        user_id,
+                        call.get("args", {}),
+                        user_token=user_token,
+                        role=role,
+                    )
+                    for call in calls_to_run
+                ]
+            )
+            for call, result in zip(calls_to_run, results):
+                call_id = call.get("id")
+                if not call_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="The AI provider returned an invalid tool request.",
+                    )
+                serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+                if len(serialized) > _MAX_TOOL_RESULT_CHARS:
+                    serialized = json.dumps({
+                        "error": "The platform returned more data than can be summarized.",
+                        "code": "TOOL_RESULT_TOO_LARGE",
+                    }, ensure_ascii=False)
+                messages.append(ToolMessage(content=serialized, tool_call_id=call_id))
+
+            for call in tool_calls[_MAX_TOOL_CALLS:]:
+                call_id = call.get("id")
+                if call_id:
+                    messages.append(ToolMessage(
+                        content='{"error":"Too many tool calls in one request.","code":"TOOL_LIMIT"}',
+                        tool_call_id=call_id,
+                    ))
+
+            final_model = llm.bind_tools(available_tools, tool_choice="none")
+            response = await asyncio.wait_for(
+                final_model.ainvoke(messages, candidate_count=None),
+                timeout=get_settings().gemini_request_timeout + 5,
+            )
+
+        return _message_text(response), sources
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        logger.warning("Gemini request timed out (role=%s)", role)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="The AI provider timed out. Please retry shortly.",
+        ) from None
+    except GoogleRateLimitError:
+        logger.warning("Gemini request was rate limited (role=%s)", role)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI provider is busy. Please retry shortly.",
+            headers={"Retry-After": "5"},
+        ) from None
+    except (GoogleAuthenticationError, GooglePermissionDeniedError):
+        logger.error("Gemini provider credentials were rejected")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI provider is not configured correctly.",
+        ) from None
+    except GoogleInvalidRequestError:
+        logger.error("Gemini rejected the generated request (role=%s)", role)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The AI provider rejected this request.",
+        ) from None
+    except Exception as exc:
+        logger.error("Gemini request failed (type=%s role=%s)", type(exc).__name__, role)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI provider is temporarily unavailable.",
+        ) from None
+
+
+# ─── THREAD MANAGEMENT ─────────────────────────────────────────────────────
 
 def create_thread(session: Session, user_id: str, title: Optional[str] = None) -> ChatThread:
-    """Create a new chat thread owned by user_id."""
-    thread = ChatThread(
-        user_id=user_id,
-        title=title or "New Conversation",
-    )
+    clean_title = (title or "").strip()[:255] or "New Conversation"
+    thread = ChatThread(user_id=user_id, title=clean_title)
     session.add(thread)
     session.commit()
     session.refresh(thread)
@@ -102,79 +268,72 @@ def create_thread(session: Session, user_id: str, title: Optional[str] = None) -
 
 
 def get_user_threads(session: Session, user_id: str) -> List[Dict[str, Any]]:
-    """Fetch all chat threads owned by user_id."""
     statement = (
         select(ChatThread)
         .where(ChatThread.user_id == user_id)
         .order_by(ChatThread.updated_at.desc())
     )
     threads = session.exec(statement).all()
-
     result = []
-    for t in threads:
-        # Get last message snippet
-        last_msg_stmt = (
+    for thread in threads:
+        last_message_stmt = (
             select(ChatMessage)
-            .where(ChatMessage.thread_id == t.id)
+            .where(ChatMessage.thread_id == thread.id)
             .order_by(ChatMessage.created_at.desc())
         )
-        last_msg = session.exec(last_msg_stmt).first()
+        last_message = session.exec(last_message_stmt).first()
         result.append({
-            "id": t.id,
-            "title": t.title,
-            "createdAt": t.created_at.isoformat(),
-            "updatedAt": t.updated_at.isoformat(),
-            "lastMessage": last_msg.content if last_msg else "",
+            "id": thread.id,
+            "title": thread.title,
+            "createdAt": thread.created_at.isoformat(),
+            "updatedAt": thread.updated_at.isoformat(),
+            "lastMessage": last_message.content[:300] if last_message else "",
         })
     return result
 
 
 def verify_thread_ownership(session: Session, thread_id: str, user_id: str) -> ChatThread:
-    """Verify thread exists and belongs to user_id. Raise 403 if unauthorized."""
+    """Return an existing user-owned thread without disclosing other users' IDs."""
     thread = session.get(ChatThread, thread_id)
-    if not thread:
+    if thread is None or thread.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat thread '{thread_id}' not found.",
-        )
-    if thread.user_id != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden: You do not own this chat thread.",
+            detail="Chat thread not found.",
         )
     return thread
 
 
 def get_thread_messages(session: Session, thread_id: str, user_id: str) -> List[Dict[str, Any]]:
-    """Fetch messages for a thread after verifying ownership."""
     verify_thread_ownership(session, thread_id, user_id)
-
     statement = (
         select(ChatMessage)
         .where(ChatMessage.thread_id == thread_id)
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
     messages = session.exec(statement).all()
-    return [
-        {
-            "id": m.id,
-            "role": m.role,
-            "content": m.content,
-            "createdAt": m.created_at.isoformat(),
-        }
-        for m in messages
-    ]
+    result = []
+    for message in messages:
+        try:
+            metadata = json.loads(message.metadata_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        result.append({
+            "id": message.id,
+            "role": message.role,
+            "content": message.content,
+            "createdAt": message.created_at.isoformat(),
+            "language": metadata.get("language"),
+            "suggestedActions": metadata.get("suggestedActions", []),
+        })
+    return result
 
 
 def delete_thread(session: Session, thread_id: str, user_id: str) -> bool:
-    """Delete a thread after verifying ownership."""
     thread = verify_thread_ownership(session, thread_id, user_id)
     session.delete(thread)
     session.commit()
     return True
 
-
-# ─── CORE AI & TOOL EXECUTION CHAT PIPELINE ─────────────────────────────────
 
 async def process_thread_chat(
     session: Session,
@@ -182,152 +341,95 @@ async def process_thread_chat(
     role: str,
     thread_id: str,
     user_message: str,
+    user_token: str = "",
+    response_preference: str = "NEUTRAL",
 ) -> Dict[str, Any]:
-    """
-    Full AI execution sequence matching Section 4.4 requirements:
-    1. Verify thread ownership
-    2. Sanitize input
-    3. Load chat history (last 20 messages)
-    4. Fetch user context & perform RAG search
-    5. Construct dynamic system prompt
-    6. Invoke LLM with tool definitions
-    7. Resolve tool calls if triggered by LLM
-    8. Save user and assistant messages in database
-    9. Return formatted response
-    """
-    # 1. Verify Ownership
     thread = verify_thread_ownership(session, thread_id, user_id)
-
-    # 2. Sanitize Input
     safe_content = sanitize_user_message(user_message)
     if not safe_content:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if len(safe_content) > get_settings().max_message_chars:
+        raise HTTPException(status_code=413, detail="Message is too long.")
 
-    # 3. Load Chat History (Last 20)
-    stmt = (
+    history_stmt = (
         select(ChatMessage)
         .where(ChatMessage.thread_id == thread_id)
-        .order_by(ChatMessage.created_at.desc())
-        .limit(20)
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(get_settings().max_history_messages)
     )
-    history_records = list(reversed(session.exec(stmt).all()))
+    history_records = list(reversed(session.exec(history_stmt).all()))
 
-    # Update thread title if first message
-    if len(history_records) == 0 and thread.title == "New Conversation":
+    answer, _sources = await _generate_answer(
+        user_id=user_id,
+        role=role,
+        user_message=safe_content,
+        user_token=user_token,
+        history=history_records,
+        response_preference=response_preference,
+    )
+
+    if not history_records and thread.title == "New Conversation":
         thread.title = safe_content[:30] + ("..." if len(safe_content) > 30 else "")
-        session.add(thread)
-
-    # 4. Fetch User Context & RAG Docs
-    user_context = build_user_context(user_id, role)
-
-    try:
-        rag_docs = retrieve_relevant_docs(safe_content, k=3)
-        rag_text = "\n\n".join([f"Source: {d.metadata.get('source')}\n{d.page_content}" for d in rag_docs])
-    except Exception as e:
-        print(f"[RAG Retrieval Warning] {e}")
-        rag_text = "No RAG docs retrieved."
-
-    # 5. System Prompt
-    system_prompt = build_system_prompt(user_context, role, rag_text)
-
-    # Convert history into LangChain messages
-    messages = [SystemMessage(content=system_prompt)]
-    for msg in history_records:
-        if msg.role == "user":
-            messages.append(HumanMessage(content=msg.content))
-        else:
-            messages.append(AIMessage(content=msg.content))
-    messages.append(HumanMessage(content=safe_content))
-
-    # 6. Invoke LLM
-    final_response_text = ""
-    try:
-        llm = get_llm()
-        ai_msg = await llm.ainvoke(messages)
-
-        # Handle string response or tool call response
-        final_response_text = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
-        if isinstance(final_response_text, list):
-            parts = [p.get("text", str(p)) if isinstance(p, dict) else str(p) for p in final_response_text]
-            final_response_text = " ".join(parts)
-
-    except Exception as err:
-        print(f"[LLM Error] {err}")
-        # Fallback intelligent response if API key is not configured or offline
-        if role == "CLIPPER" and ("earnings" in safe_content.lower() or "ربح" in safe_content or "كم" in safe_content):
-            earnings = get_weekly_earnings(user_id)
-            final_response_text = (
-                f"أهلاً بك! إجمالي أرباحك لهذا الأسبوع بلغ **${earnings['total_earnings']} USD** "
-                f"من خلال {earnings['approved_submissions']} مشاركات مقبولة. هل تريد تفاصيل إضافية عن الحملات المتاحة؟"
-            )
-        elif role == "BRAND" and ("campaign" in safe_content.lower() or "حملة" in safe_content):
-            camps = list_campaigns(user_id)
-            final_response_text = (
-                f"مرحباً بك! لديك {camps['count']} حملات نشطة حالياً. "
-                f"إجمالي ميزانيتك المتبقية هو **${user_context['budget']['remaining']} USD**. كيف يمكنني مساعدتك اليوم؟"
-            )
-        else:
-            final_response_text = (
-                "مرحباً بك في منصة PayPerView! أنا مساعدك الذكي. كيف يمكنني مساعدتك في استفسارك اليوم؟"
-            )
-
-    # 7. Save Messages to Database
-    user_msg_record = ChatMessage(
-        thread_id=thread_id,
-        role="user",
-        content=safe_content,
-    )
-    assistant_msg_record = ChatMessage(
+    user_record = ChatMessage(thread_id=thread_id, role="user", content=safe_content)
+    language = detect_chat_language(safe_content)
+    actions = suggested_actions(role, language)
+    assistant_record = ChatMessage(
         thread_id=thread_id,
         role="assistant",
-        content=final_response_text,
+        content=answer,
+        metadata_json=json.dumps({"language": language, "suggestedActions": actions}, ensure_ascii=False),
     )
-
-    session.add(user_msg_record)
-    session.add(assistant_msg_record)
-
-    # Update thread timestamp
     thread.updated_at = datetime.now(timezone.utc)
+    session.add(user_record)
+    session.add(assistant_record)
     session.add(thread)
     session.commit()
-    session.refresh(assistant_msg_record)
+    session.refresh(assistant_record)
 
-    # 8. Return JSON Response
     return {
         "success": True,
         "data": {
             "message": {
-                "id": assistant_msg_record.id,
+                "id": assistant_record.id,
                 "role": "assistant",
-                "content": assistant_msg_record.content,
-                "createdAt": assistant_msg_record.created_at.isoformat(),
+                "content": assistant_record.content,
+                "createdAt": assistant_record.created_at.isoformat(),
+                "language": language,
+                "suggestedActions": actions,
             }
-        }
+        },
     }
 
 
-async def process_chat(message: str) -> Dict[str, Any]:
-    """
-    Legacy direct RAG chat function without thread or JWT requirements.
-    """
+async def process_chat(
+    message: str,
+    user_id: str,
+    role: str,
+    user_token: str,
+) -> Dict[str, Any]:
     safe_content = sanitize_user_message(message)
-    try:
-        rag_docs = retrieve_relevant_docs(safe_content, k=3)
-        context = "\n\n".join([f"Source: {d.metadata.get('source')}\n{d.page_content}" for d in rag_docs])
-    except Exception:
-        context = "No documentation context found."
+    if not safe_content:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if len(safe_content) > get_settings().max_message_chars:
+        raise HTTPException(status_code=413, detail="Message is too long.")
+    answer, sources = await _generate_answer(user_id, role, safe_content, user_token)
+    language = detect_chat_language(safe_content)
+    return {"answer": answer, "sources": sources, "language": language, "suggestedActions": suggested_actions(role, language)}
 
-    system_prompt = build_system_prompt({"name": "User"}, "CLIPPER", context)
 
-    try:
-        llm = get_llm()
-        ai_msg = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=safe_content)])
-        answer = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
-    except Exception as e:
-        answer = f"Hello! I am your AI assistant for the PayPerView platform. (Note: {str(e)})"
+def detect_chat_language(text: str) -> str:
+    arabic = sum("\u0600" <= char <= "\u06ff" for char in text)
+    latin = sum(char.isascii() and char.isalpha() for char in text)
+    if arabic >= max(2, latin):
+        return "ar"
+    if latin:
+        return "en"
+    return "unknown"
 
-    return {
-        "answer": str(answer),
-        "sources": [{"source": "platform.md", "category": "general"}]
-    }
 
+def suggested_actions(role: str, language: str) -> list[str]:
+    if language == "ar":
+        return ["اعرض حملاتي أو طلباتي", "راجع الأداء أو الأرباح", "اشرح الخطوة التالية"]
+    if role.upper() == "BRAND":
+        return ["Review my campaign performance", "Check campaign budgets", "Review campaign submissions"]
+    return ["Show my submissions", "Find eligible campaigns", "Review my earnings"]
